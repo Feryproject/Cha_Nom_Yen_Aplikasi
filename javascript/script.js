@@ -1557,7 +1557,8 @@ function SalesInputView({ branches, selectedBranchId, materials, setMaterials, b
         const bStock = branchMaterialStock[branchId] || {};
         const matStatus = {};
         materials.forEach(m => {
-            const prev = bStock[m.id] || { qty: '0', status: 'Aman' };
+            if (!Object.prototype.hasOwnProperty.call(bStock, m.id)) return;
+            const prev = bStock[m.id];
             matStatus[m.id] = { qty: prev.qty || '0', status: prev.status || 'Aman' };
         });
 
@@ -1664,10 +1665,11 @@ function SalesInputView({ branches, selectedBranchId, materials, setMaterials, b
             const bStock = branchMaterialStock[inputBranchId] || {};
             const res = {};
             materials.forEach(m => {
-                const prev = bStock[m.id] || { qty: '0', status: 'Aman' };
+                if (!Object.prototype.hasOwnProperty.call(bStock, m.id)) return;
+                const prev = bStock[m.id];
                 res[m.id] = { qty: prev.qty || '0', status: prev.status || 'Aman' };
             });
-            setMatStatus(prev => ({ ...prev, ...res }));
+            setMatStatus(res);
         }
     }, [inputBranchId, materials]);
 
@@ -1798,34 +1800,19 @@ function SalesInputView({ branches, selectedBranchId, materials, setMaterials, b
             qris: Math.max(0, Number(qris) || 0),
             deposit: Math.max(0, Number(deposit) || 0),
             notes: notes.trim(),
-            materialStatus: matStatus,
+            materialStatus: Object.fromEntries(
+                Object.entries(branchMaterialStock[inputBranchId] || {}).map(([materialId, value]) => [
+                    materialId,
+                    { qty: value?.qty || '0', status: value?.status || 'Aman' }
+                ])
+            ),
             createdBy: authUser?.uid || 'unknown-user',
             createdByName: authUser?.displayName || staff1.trim() || 'Karyawan',
             createdAt: new Date().toISOString()
         };
 
-        // PENTING: gabungkan (merge) status bahan dari form ini ke stok cabang yang
-        // SUDAH ADA — jangan mengganti seluruh isi stok cabang. Form penjualan ini
-        // hanya menampilkan sebagian bahan (matStatus), jadi mengganti total akan
-        // menghilangkan item stok lain (mis. yang ditambahkan lewat Menu Stok) setiap
-        // kali laporan penjualan disimpan.
-        setBranchMaterialStock(prev => ({
-            ...prev,
-            [inputBranchId]: {
-                ...(prev[inputBranchId] || {}),
-                ...Object.fromEntries(
-                    Object.entries(matStatus).map(([materialId, value]) => [
-                        materialId,
-                        {
-                            ...(prev[inputBranchId]?.[materialId] || {}),
-                            ...(value || {}),
-                            updatedBy: authUser?.uid || 'unknown-user',
-                            updatedAt: new Date().toISOString()
-                        }
-                    ])
-                )
-            }
-        }));
+        // Stok bahan HANYA diubah lewat menu Stok. Menyimpan laporan penjualan tidak lagi
+        // menulis/menimpa stok cabang (sebelumnya menyebarkan semua bahan ke semua cabang).
 
         onSaveLog(newLog);
     };
@@ -2189,23 +2176,35 @@ function InventoryView({ branches, selectedBranchId, materials, setMaterials, br
     const [editingMaterialName, setEditingMaterialName] = useState('');
 
     const activeBranchStock = branchMaterialStock[activeBranchId] || {};
-    const isFilledForAdmin = (materialId) => {
-        if (!isAdminView) return true;
-        const rawQty = activeBranchStock[materialId]?.qty;
+
+    // Admin dengan filter "Semua Cabang" melihat stok dari SEMUA cabang (tiap item diberi label cabangnya).
+    // Admin dengan cabang tertentu, atau karyawan, hanya melihat satu cabang.
+    const isAllView = isAdminView && selectedBranchId === 'ALL';
+    const isFilledQty = (rawQty) => {
         const qtyText = (rawQty === undefined || rawQty === null) ? '' : String(rawQty).trim();
         return qtyText !== '' && qtyText !== '0';
     };
 
-    const groupedMaterials = useMemo(() => ({
-        bahan: materials.filter(item => {
-            const categoryOk = (item.category || 'bahan') === 'bahan';
-            return categoryOk && Object.prototype.hasOwnProperty.call(activeBranchStock, item.id) && isFilledForAdmin(item.id);
-        }),
-        perlengkapan: materials.filter(item => {
-            const categoryOk = (item.category || 'perlengkapan') === 'perlengkapan';
-            return categoryOk && Object.prototype.hasOwnProperty.call(activeBranchStock, item.id) && isFilledForAdmin(item.id);
-        })
-    }), [materials, activeBranchStock, isAdminView]);
+    const buildEntries = (categoryKey) => {
+        const branchIds = isAllView ? branches.map(b => b.id) : [activeBranchId];
+        const list = [];
+        branchIds.forEach(branchId => {
+            const branchStock = branchMaterialStock[branchId] || {};
+            const branchName = branches.find(b => b.id === branchId)?.name || branchId;
+            materials.forEach(item => {
+                if ((item.category || categoryKey) !== categoryKey) return;
+                if (!Object.prototype.hasOwnProperty.call(branchStock, item.id)) return;
+                if (isAdminView && !isFilledQty(branchStock[item.id]?.qty)) return;
+                list.push({ key: `${branchId}_${item.id}`, material: item, data: branchStock[item.id], branchName });
+            });
+        });
+        return list;
+    };
+
+    const groupedMaterials = {
+        bahan: buildEntries('bahan'),
+        perlengkapan: buildEntries('perlengkapan')
+    };
 
     const handleUpdateMaterial = (mId, field, value) => {
         if (isAdminView) return;
@@ -2305,8 +2304,13 @@ function InventoryView({ branches, selectedBranchId, materials, setMaterials, br
                 <div className="flex items-center gap-2 flex-wrap">
                     <span className="text-xs font-bold text-gray-600">Cabang:</span>
                     <span className="px-3 me-1 py-1.5 rounded-xl bg-amber-100 text-amber-950 font-extrabold text-xs border border-amber-300">
-                        📍 {branches.find(b => b.id === activeBranchId)?.name}
+                        📍 {isAllView ? 'Semua Cabang' : branches.find(b => b.id === activeBranchId)?.name}
                     </span>
+                    {!isAdminView && selectedBranchId === 'ALL' && (
+                        <span className="text-[10px] font-bold text-rose-600">
+                            Cabang belum dipilih! Pilih cabang di kanan atas, kalau tidak data masuk ke cabang pertama.
+                        </span>
+                    )}
                 </div>
             </div>
 
@@ -2380,14 +2384,18 @@ function InventoryView({ branches, selectedBranchId, materials, setMaterials, br
                                 </div>
                             ) : (
                                 <div className="grid grid-cols-2 gap-2.5 sm:gap-3 lg:grid-cols-3">
-                                    {items.map(m => {
-                                        const data = activeBranchStock[m.id] || { qty: '', status: 'Aman', notes: 'Belum ada catatan' };
+                                    {items.map(entry => {
+                                        const m = entry.material;
+                                        const data = entry.data || { qty: '', status: 'Aman', notes: 'Belum ada catatan' };
 
                                         return (
-                                            <div key={m.id} className="bg-brand-50/50 p-2.5 rounded-xl border border-brand-200/80 shadow-sm min-w-0">
+                                            <div key={entry.key} className="bg-brand-50/50 p-2.5 rounded-xl border border-brand-200/80 shadow-sm min-w-0">
                                                 <div className="border-b border-gray-100 pb-1.5 flex items-start justify-between gap-2">
                                                     <div className="font-extrabold text-brand-950 text-[10px] leading-tight break-words flex-1">
                                                         {m.name}
+                                                        {isAllView && (
+                                                            <span className="block text-[9px] font-bold text-amber-700 mt-0.5">📍 {entry.branchName}</span>
+                                                        )}
                                                     </div>
                                                     {!isAdminView && (
                                                         <button
