@@ -86,6 +86,22 @@ const getMiloChargeForBranch = (branchId = '', branchName = '') => {
     return isMiloEnabledForBranch(branchId, branchName) ? 2000 : 0;
 };
 
+// Stok gelas disimpan di collection branchMaterialStock yang sama dengan stok bahan,
+// dengan materialId berawalan "cup_" (mis. cup_p1), jadi tidak butuh collection baru.
+const CUP_STOCK_PREFIX = 'cup_';
+const getCupStockKey = (productId) => `${CUP_STOCK_PREFIX}${productId}`;
+const isCupStockKey = (key) => String(key || '').startsWith(CUP_STOCK_PREFIX);
+// Satuan yang ditampilkan di menu Stok > Perlengkapan untuk produk yang dijual.
+const PRODUCT_STOCK_UNITS = { p1: 'cup', p2: 'cup', p3: 'cup', p4: 'botol', p5: 'cup' };
+const getSavedCupQty = (branchStock = {}, productId) => {
+    const entry = branchStock[getCupStockKey(productId)];
+    if (!entry) return null;
+    const raw = String(entry.qty ?? '').trim();
+    if (raw === '') return null;
+    const num = parseInt(raw, 10);
+    return Number.isFinite(num) ? Math.max(0, num) : null;
+};
+
 // Default Materials & Supplies
 const DEFAULT_MATERIALS = [
     { id: 'm1', name: 'Sanford', defaultUnit: 'botol/dus', category: 'bahan' },
@@ -638,7 +654,7 @@ const APP_BG_OPACITY = 0.12;
 
 // Nomor WhatsApp Bos untuk menerima laporan, format 62xxxxxxxxxx (tanpa + atau 0 di depan).
 // Kosongkan ("") untuk membuka WhatsApp tanpa nomor tertentu (karyawan pilih kontak sendiri).
-const ADMIN_WHATSAPP_NUMBER = '6282173376647';
+const ADMIN_WHATSAPP_NUMBER = '';
 
 function AppBackground() {
     return (
@@ -1576,11 +1592,12 @@ function DashboardView({ branches, selectedBranchId, salesLogs, getBranchName, o
 function SalesInputView({ branches, selectedBranchId, materials, setMaterials, branchMaterialStock, setBranchMaterialStock, authUser, onSaveLog, showToast, salesDraftRef }) {
     const createBlankDraft = (branchId = selectedBranchId !== 'ALL' ? selectedBranchId : (branches[0]?.id || '')) => {
         const selectedBranch = branches.find(b => b.id === branchId) || branches[0];
+        const savedCupStock = branchMaterialStock[branchId] || {};
         const initialStockData = {
-            p1: { initial: 0, final: 0, price: 15000 },
-            p2: { initial: 0, final: 0, price: 10000 },
-            p3: { initial: 0, final: 0, price: 10000 },
-            p4: { initial: 0, final: 0, price: getProductPriceByBranch('p4', branchId, selectedBranch?.name || '') },
+            p1: { initial: getSavedCupQty(savedCupStock, 'p1') ?? 0, final: 0, price: 15000 },
+            p2: { initial: getSavedCupQty(savedCupStock, 'p2') ?? 0, final: 0, price: 10000 },
+            p3: { initial: getSavedCupQty(savedCupStock, 'p3') ?? 0, final: 0, price: 10000 },
+            p4: { initial: getSavedCupQty(savedCupStock, 'p4') ?? 0, final: 0, price: getProductPriceByBranch('p4', branchId, selectedBranch?.name || '') },
         };
 
         const bStock = branchMaterialStock[branchId] || {};
@@ -1668,6 +1685,34 @@ function SalesInputView({ branches, selectedBranchId, materials, setMaterials, b
         return getVisibleProductsForBranch(inputBranchId, selectedBranch?.name || '');
     }, [inputBranchId, branches]);
 
+    // Isi otomatis Stok Awal dari Stok Gelas yang tersimpan (hanya baris yang masih kosong).
+    const cupPrefillKey = visibleProducts
+        .map(p => `${p.id}:${getSavedCupQty(branchMaterialStock[inputBranchId] || {}, p.id) ?? ''}`)
+        .join('|');
+
+    useEffect(() => {
+        const savedStock = branchMaterialStock[inputBranchId] || {};
+        const branchName = branches.find(b => b.id === inputBranchId)?.name || '';
+        setStockData(prev => {
+            let changed = false;
+            const next = { ...prev };
+            visibleProducts.forEach(p => {
+                const saved = getSavedCupQty(savedStock, p.id);
+                const cur = prev[p.id] || {};
+                if (saved !== null && saved > 0 && !cur.initial && !cur.final) {
+                    next[p.id] = {
+                        final: 0,
+                        price: getProductPriceByBranch(p.id, inputBranchId, branchName),
+                        ...cur,
+                        initial: saved
+                    };
+                    changed = true;
+                }
+            });
+            return changed ? next : prev;
+        });
+    }, [inputBranchId, cupPrefillKey]);
+
     useEffect(() => {
         if (!['b2', 'b3'].includes(inputBranchId)) {
             setMiloQty(0);
@@ -1702,6 +1747,31 @@ function SalesInputView({ branches, selectedBranchId, materials, setMaterials, b
         }
     }, [inputBranchId, materials]);
 
+    // Stok Awal yang diketik disimpan otomatis ke Firebase (tunggu 0,8 detik setelah berhenti mengetik)
+    // supaya tetap ada walau halaman ditutup / keluar dari website.
+    const setBranchStockRef = useRef(setBranchMaterialStock);
+    setBranchStockRef.current = setBranchMaterialStock;
+    const initialSaveTimers = useRef({});
+
+    const scheduleSaveInitialStock = (pId, qty) => {
+        const branchId = inputBranchId;
+        if (!branchId) return;
+        clearTimeout(initialSaveTimers.current[pId]);
+        initialSaveTimers.current[pId] = setTimeout(() => {
+            setBranchStockRef.current(prev => {
+                const branchMap = { ...(prev[branchId] || {}) };
+                branchMap[getCupStockKey(pId)] = {
+                    qty: String(qty),
+                    status: 'Aman',
+                    notes: 'Stok awal tersimpan',
+                    updatedBy: authUser?.uid || 'system',
+                    updatedAt: new Date().toISOString()
+                };
+                return { ...prev, [branchId]: branchMap };
+            });
+        }, 800);
+    };
+
     const handleStockChange = (pId, field, val) => {
         const numVal = Math.max(0, parseInt(val) || 0);
         setStockData(prev => ({
@@ -1711,6 +1781,9 @@ function SalesInputView({ branches, selectedBranchId, materials, setMaterials, b
                 [field]: numVal
             }
         }));
+        if (field === 'initial') {
+            scheduleSaveInitialStock(pId, numVal);
+        }
     };
 
     const addExpenseItem = () => {
@@ -1795,6 +1868,15 @@ function SalesInputView({ branches, selectedBranchId, materials, setMaterials, b
             return;
         }
 
+        const soldOutItems = visibleProducts.filter(p => {
+            const row = stockData[p.id] || {};
+            return (Number(row.initial) || 0) > 0 && !(Number(row.final) > 0);
+        });
+        if (soldOutItems.length > 0) {
+            const proceed = window.confirm(`Stok Akhir ${soldOutItems.map(p => p.name).join(', ')} masih 0, artinya semuanya dianggap terjual habis. Lanjut simpan laporan?`);
+            if (!proceed) return;
+        }
+
         const normalizedExpenseItems = expenseItems
             .filter(item => item.name.trim() || parseCurrencyInput(item.amount) > 0)
             .map(item => ({
@@ -1830,7 +1912,7 @@ function SalesInputView({ branches, selectedBranchId, materials, setMaterials, b
             deposit: Math.max(0, Number(deposit) || 0),
             notes: notes.trim(),
             materialStatus: Object.fromEntries(
-                Object.entries(branchMaterialStock[inputBranchId] || {}).map(([materialId, value]) => [
+                Object.entries(branchMaterialStock[inputBranchId] || {}).filter(([materialId]) => !isCupStockKey(materialId)).map(([materialId, value]) => [
                     materialId,
                     { qty: value?.qty || '0', status: value?.status || 'Aman' }
                 ])
@@ -1842,6 +1924,27 @@ function SalesInputView({ branches, selectedBranchId, materials, setMaterials, b
 
         // Stok bahan HANYA diubah lewat menu Stok. Menyimpan laporan penjualan tidak lagi
         // menulis/menimpa stok cabang (sebelumnya menyebarkan semua bahan ke semua cabang).
+
+        // Stok Akhir otomatis masuk ke Stok > Perlengkapan (hanya produk yang diisi hari ini).
+        const trackedProducts = visibleProducts.filter(p => {
+            const row = stockData[p.id] || {};
+            return (Number(row.initial) || 0) > 0 || (Number(row.final) || 0) > 0;
+        });
+        if (trackedProducts.length > 0) {
+            setBranchMaterialStock(prev => {
+                const branchMap = { ...(prev[inputBranchId] || {}) };
+                trackedProducts.forEach(p => {
+                    branchMap[getCupStockKey(p.id)] = {
+                        qty: String(Math.max(0, parseInt(stockData[p.id]?.final, 10) || 0)),
+                        status: 'Aman',
+                        notes: 'Stok gelas',
+                        updatedBy: authUser?.uid || 'system',
+                        updatedAt: new Date().toISOString()
+                    };
+                });
+                return { ...prev, [inputBranchId]: branchMap };
+            });
+        }
 
         onSaveLog(newLog);
     };
@@ -1920,6 +2023,9 @@ function SalesInputView({ branches, selectedBranchId, materials, setMaterials, b
                     <i className="fa-solid fa-cup-straw text-amber-700"></i>
                     2. Input Stok Awal & Stok Akhir Gelas
                 </h3>
+                <p className="text-[11px] text-emerald-700 font-semibold -mt-2">
+                    Stok Awal yang Anda isi tersimpan otomatis, jadi tetap ada walau keluar dari website. Bisa diubah kapan saja kalau ada penambahan. Setelah laporan disimpan, Stok Akhir otomatis masuk ke menu Stok → Perlengkapan dan jadi Stok Awal berikutnya.
+                </p>
 
                 <div className="overflow-x-auto">
                     <table className="w-full text-left border-collapse stock-table">
@@ -2220,8 +2326,32 @@ function InventoryView({ branches, selectedBranchId, materials, setMaterials, br
         branchIds.forEach(branchId => {
             const branchStock = branchMaterialStock[branchId] || {};
             const branchName = branches.find(b => b.id === branchId)?.name || branchId;
+
+            // Produk yang dijual (Gelas Besar, Gelas Kecil, Sanford, dll) otomatis jadi item Perlengkapan
+            // di semua cabang. Jumlahnya diisi dari Stok Akhir pada form penjualan.
+            const productList = categoryKey === 'perlengkapan'
+                ? getVisibleProductsForBranch(branchId, branches.find(b => b.id === branchId)?.name || '')
+                : [];
+            const productNames = new Set(productList.map(p => p.name.trim().toLowerCase()));
+            productList.forEach(p => {
+                const stockKey = getCupStockKey(p.id);
+                const stockData = branchStock[stockKey];
+                const hasValue = stockData && String(stockData.qty ?? '').trim() !== '';
+                if (isAdminView && !hasValue) return;
+                list.push({
+                    key: `${branchId}_${stockKey}`,
+                    material: { id: stockKey, name: p.name },
+                    data: stockData || { qty: '', status: 'Aman', notes: '' },
+                    branchName,
+                    isProduct: true,
+                    unit: PRODUCT_STOCK_UNITS[p.id] || 'cup'
+                });
+            });
+
             materials.forEach(item => {
                 if ((item.category || categoryKey) !== categoryKey) return;
+                // Hindari dobel: item lama bernama sama dengan produk (mis. "Gelas Panas") disembunyikan.
+                if (categoryKey === 'perlengkapan' && productNames.has(String(item.name || '').trim().toLowerCase())) return;
                 if (!Object.prototype.hasOwnProperty.call(branchStock, item.id)) return;
                 if (isAdminView && !isFilledQty(branchStock[item.id]?.qty)) return;
                 list.push({ key: `${branchId}_${item.id}`, material: item, data: branchStock[item.id], branchName });
@@ -2387,7 +2517,7 @@ function InventoryView({ branches, selectedBranchId, materials, setMaterials, br
                         key: 'perlengkapan',
                         title: 'Perlengkapan Operasional',
                         icon: 'fa-toolbox',
-                        description: 'Alat dan kebutuhan operasi pendukung seperti sedotan, kantong, dan gelas.'
+                        description: 'Alat dan kebutuhan operasi pendukung. Stok produk yang dijual (gelas, Sanford, dll) terisi otomatis dari Stok Akhir laporan penjualan.'
                     }
                 ].map(group => {
                     const items = groupedMaterials[group.key] || [];
@@ -2416,6 +2546,7 @@ function InventoryView({ branches, selectedBranchId, materials, setMaterials, br
                                     {items.map(entry => {
                                         const m = entry.material;
                                         const data = entry.data || { qty: '', status: 'Aman', notes: 'Belum ada catatan' };
+                                        const isProduct = Boolean(entry.isProduct);
 
                                         return (
                                             <div key={entry.key} className="bg-brand-50/50 p-2.5 rounded-xl border border-brand-200/80 shadow-sm min-w-0">
@@ -2426,7 +2557,7 @@ function InventoryView({ branches, selectedBranchId, materials, setMaterials, br
                                                             <span className="block text-[9px] font-bold text-amber-700 mt-0.5">📍 {entry.branchName}</span>
                                                         )}
                                                     </div>
-                                                    {!isAdminView && (
+                                                    {!isAdminView && !isProduct && (
                                                         <button
                                                             type="button"
                                                             onClick={() => handleDeleteMaterial(m.id)}
@@ -2442,7 +2573,25 @@ function InventoryView({ branches, selectedBranchId, materials, setMaterials, br
                                                     <div className="text-[8px] font-extrabold uppercase tracking-wide text-gray-500 mb-1">
                                                         Kondisi stok
                                                     </div>
-                                                    {isAdminView ? (
+                                                    {isProduct ? (
+                                                        isAdminView ? (
+                                                            <div className="text-xs font-bold text-brand-950 break-words min-h-[28px]">
+                                                                {String(data.qty ?? '').trim() !== '' ? `${data.qty} ${entry.unit}` : 'Belum ada catatan stok'}
+                                                            </div>
+                                                        ) : (
+                                                            <div className="flex items-baseline gap-1.5">
+                                                                <input
+                                                                    type="text"
+                                                                    inputMode="numeric"
+                                                                    value={data.qty ?? ''}
+                                                                    onChange={(e) => handleUpdateMaterial(m.id, 'qty', e.target.value.replace(/\D/g, ''))}
+                                                                    placeholder="0"
+                                                                    className="w-full bg-transparent border-0 p-0 text-xs font-bold text-brand-950 placeholder:text-gray-400 focus:outline-none focus:ring-0"
+                                                                />
+                                                                <span className="text-xs font-bold text-gray-500 shrink-0">{entry.unit}</span>
+                                                            </div>
+                                                        )
+                                                    ) : isAdminView ? (
                                                         <div className="text-xs font-bold text-brand-950 break-words min-h-[28px]">
                                                             {data.qty || 'Belum ada catatan stok'}
                                                         </div>
@@ -2965,6 +3114,7 @@ function ReportExportModal({ log, branchName, materials, branchMaterialStock = {
     const materialStatusMap = log.materialStatus && Object.keys(log.materialStatus).length > 0 ? log.materialStatus : fallbackStock;
     const stockRows = Object.entries(materialStatusMap || {})
         .filter(([mId, value]) => {
+            if (isCupStockKey(mId)) return false;
             const rawQty = typeof value === 'string' ? value : (value?.qty ?? '');
             const cleanQty = String(rawQty ?? '').trim();
             return cleanQty !== '' && cleanQty !== '0' && cleanQty.toLowerCase() !== 'belum ada catatan';
