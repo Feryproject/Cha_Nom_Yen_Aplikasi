@@ -1685,6 +1685,28 @@ function SalesInputView({ branches, selectedBranchId, materials, setMaterials, b
         return getVisibleProductsForBranch(inputBranchId, selectedBranch?.name || '');
     }, [inputBranchId, branches]);
 
+    // Setiap cabang punya stok sendiri. Saat ganti cabang, tabel diisi dengan stok cabang tujuan
+    // (bukan membawa angka cabang sebelumnya), dan Stok Akhir dikosongkan.
+    const lastInputBranchRef = useRef(inputBranchId);
+    useEffect(() => {
+        if (lastInputBranchRef.current === inputBranchId) return;
+        lastInputBranchRef.current = inputBranchId;
+        const savedStock = branchMaterialStock[inputBranchId] || {};
+        const branchName = branches.find(b => b.id === inputBranchId)?.name || '';
+        setStockData(prev => {
+            const next = { ...prev };
+            PRODUCTS_LIST.forEach(p => {
+                next[p.id] = {
+                    ...(prev[p.id] || {}),
+                    initial: getSavedCupQty(savedStock, p.id) ?? 0,
+                    final: 0,
+                    price: getProductPriceByBranch(p.id, inputBranchId, branchName)
+                };
+            });
+            return next;
+        });
+    }, [inputBranchId]);
+
     // Isi otomatis Stok Awal dari Stok Gelas yang tersimpan (hanya baris yang masih kosong).
     const cupPrefillKey = visibleProducts
         .map(p => `${p.id}:${getSavedCupQty(branchMaterialStock[inputBranchId] || {}, p.id) ?? ''}`)
