@@ -90,7 +90,13 @@ const getMiloChargeForBranch = (branchId = '', branchName = '') => {
 // dengan materialId berawalan "cup_" (mis. cup_p1), jadi tidak butuh collection baru.
 const CUP_STOCK_PREFIX = 'cup_';
 const getCupStockKey = (productId) => `${CUP_STOCK_PREFIX}${productId}`;
-const isCupStockKey = (key) => String(key || '').startsWith(CUP_STOCK_PREFIX);
+// "awal_" = Stok Awal untuk laporan berikutnya (per cabang). "cup_" = stok yang tampil di Stok > Perlengkapan (dari Stok Akhir).
+const AWAL_STOCK_PREFIX = 'awal_';
+const getAwalStockKey = (productId) => `${AWAL_STOCK_PREFIX}${productId}`;
+const isCupStockKey = (key) => {
+    const text = String(key || '');
+    return text.startsWith(CUP_STOCK_PREFIX) || text.startsWith(AWAL_STOCK_PREFIX);
+};
 // Satuan yang ditampilkan di menu Stok > Perlengkapan untuk produk yang dijual.
 const PRODUCT_STOCK_UNITS = { p1: 'cup', p2: 'cup', p3: 'cup', p4: 'botol', p5: 'cup' };
 const getSavedCupQty = (branchStock = {}, productId) => {
@@ -102,9 +108,74 @@ const getSavedCupQty = (branchStock = {}, productId) => {
     return Number.isFinite(num) ? Math.max(0, num) : null;
 };
 
+const getSavedAwalQty = (branchStock = {}, productId) => {
+    const entry = branchStock[getAwalStockKey(productId)];
+    if (!entry) return null;
+    const raw = String(entry.qty ?? '').trim();
+    if (raw === '') return null;
+    const num = parseInt(raw, 10);
+    return Number.isFinite(num) ? Math.max(0, num) : null;
+};
+
+// Draft form penjualan disimpan di browser (per akun) supaya tidak hilang walau keluar dari website.
+const SALES_DRAFT_STORAGE_PREFIX = 'chanomyen_sales_draft_';
+const loadStoredSalesDraft = (uid) => {
+    if (!uid) return null;
+    try {
+        const raw = window.localStorage.getItem(SALES_DRAFT_STORAGE_PREFIX + uid);
+        if (!raw) return null;
+        const parsed = JSON.parse(raw);
+        return parsed && typeof parsed === 'object' ? parsed : null;
+    } catch (error) {
+        return null;
+    }
+};
+const saveStoredSalesDraft = (uid, draft) => {
+    if (!uid) return;
+    try {
+        window.localStorage.setItem(SALES_DRAFT_STORAGE_PREFIX + uid, JSON.stringify(draft));
+    } catch (error) {
+        // abaikan (mis. penyimpanan penuh / mode privat)
+    }
+};
+// Draft versi lama menyimpan kolom kosong sebagai angka 0. Ubah jadi kosong lagi supaya
+// angka 0 yang sengaja diketik pengguna bisa dibedakan dari kolom yang belum diisi.
+const normalizeStoredStockData = (stockData) => {
+    if (!stockData || typeof stockData !== 'object') return stockData;
+    const result = {};
+    Object.entries(stockData).forEach(([pId, row]) => {
+        const isLegacyBlank = row && row.initial === 0 && row.final === 0;
+        result[pId] = isLegacyBlank ? { ...row, initial: '', final: '' } : row;
+    });
+    return result;
+};
+const normalizeStoredDraftStock = (draft) => {
+    if (!draft || draft.draftVersion === 2) return draft;
+    const next = { ...draft, stockData: normalizeStoredStockData(draft.stockData) };
+    if (draft.branchDrafts && typeof draft.branchDrafts === 'object') {
+        next.branchDrafts = Object.fromEntries(
+            Object.entries(draft.branchDrafts).map(([bId, bd]) => [bId, { ...bd, stockData: normalizeStoredStockData(bd?.stockData) }])
+        );
+    }
+    return next;
+};
+const clearStoredSalesDraft = (uid) => {
+    if (!uid) return;
+    try {
+        window.localStorage.removeItem(SALES_DRAFT_STORAGE_PREFIX + uid);
+    } catch (error) {
+        // abaikan
+    }
+};
+
+// "Sanford" di daftar Bahan sudah tidak dipakai (Sanford sekarang ada di Perlengkapan sebagai produk jualan).
+const isHiddenMaterial = (material) =>
+    Boolean(material) &&
+    (material.category || 'bahan') === 'bahan' &&
+    String(material.name || '').trim().toLowerCase() === 'sanford';
+
 // Default Materials & Supplies
 const DEFAULT_MATERIALS = [
-    { id: 'm1', name: 'Sanford', defaultUnit: 'botol/dus', category: 'bahan' },
     { id: 'm2', name: 'Gelas Panas', defaultUnit: 'pcs', category: 'perlengkapan' },
 ];
 
@@ -477,6 +548,9 @@ const matchesPeriod = (dateString, period) => {
 const emptyIfZero = (value) => {
     return (value === 0 || value === '0' || value === '0.0') ? '' : value;
 };
+
+// Kolom stok: '' = belum diisi, 0 = sengaja diisi nol (produk tidak dijual).
+const isStockEntered = (value) => value !== '' && value !== null && value !== undefined;
 
 const calculateLogGross = (log = {}) => {
     let gross = 0;
@@ -1438,13 +1512,14 @@ function DashboardView({ branches, selectedBranchId, salesLogs, getBranchName, o
                 label = new Date(`${log.date}T00:00:00`).toLocaleDateString('id-ID', { day: '2-digit', month: 'short' });
             }
 
-            const value = bucketMap.get(key) || { label, value: 0 };
+            const value = bucketMap.get(key) || { sortKey: key, label, value: 0 };
             value.value += calculateLogGross(log);
             value.label = label;
             bucketMap.set(key, value);
         });
 
-        return Array.from(bucketMap.values()).sort((a, b) => a.label.localeCompare(b.label));
+        // Urutkan menurut tanggal sebenarnya (bulan lalu hari), bukan menurut teks label.
+        return Array.from(bucketMap.values()).sort((a, b) => a.sortKey.localeCompare(b.sortKey));
     }, [filteredLogs, chartRange]);
 
     return (
@@ -1590,14 +1665,24 @@ function DashboardView({ branches, selectedBranchId, salesLogs, getBranchName, o
 }
 
 function SalesInputView({ branches, selectedBranchId, materials, setMaterials, branchMaterialStock, setBranchMaterialStock, authUser, onSaveLog, showToast, salesDraftRef }) {
+    // Ambil kembali draft yang tersimpan di browser (kalau halaman baru dibuka ulang).
+    if (salesDraftRef && (!salesDraftRef.current || Object.keys(salesDraftRef.current).length === 0)) {
+        const storedDraft = loadStoredSalesDraft(authUser?.uid);
+        if (storedDraft) {
+            salesDraftRef.current = normalizeStoredDraftStock(storedDraft);
+        }
+    }
+    const draftClearedRef = useRef(false);
+    const branchDraftsRef = useRef(salesDraftRef?.current?.branchDrafts || {});
+
     const createBlankDraft = (branchId = selectedBranchId !== 'ALL' ? selectedBranchId : (branches[0]?.id || '')) => {
         const selectedBranch = branches.find(b => b.id === branchId) || branches[0];
         const savedCupStock = branchMaterialStock[branchId] || {};
         const initialStockData = {
-            p1: { initial: getSavedCupQty(savedCupStock, 'p1') ?? 0, final: 0, price: 15000 },
-            p2: { initial: getSavedCupQty(savedCupStock, 'p2') ?? 0, final: 0, price: 10000 },
-            p3: { initial: getSavedCupQty(savedCupStock, 'p3') ?? 0, final: 0, price: 10000 },
-            p4: { initial: getSavedCupQty(savedCupStock, 'p4') ?? 0, final: 0, price: getProductPriceByBranch('p4', branchId, selectedBranch?.name || '') },
+            p1: { initial: getSavedAwalQty(savedCupStock, 'p1') ?? '', final: '', price: 15000 },
+            p2: { initial: getSavedAwalQty(savedCupStock, 'p2') ?? '', final: '', price: 10000 },
+            p3: { initial: getSavedAwalQty(savedCupStock, 'p3') ?? '', final: '', price: 10000 },
+            p4: { initial: getSavedAwalQty(savedCupStock, 'p4') ?? '', final: '', price: getProductPriceByBranch('p4', branchId, selectedBranch?.name || '') },
         };
 
         const bStock = branchMaterialStock[branchId] || {};
@@ -1670,8 +1755,12 @@ function SalesInputView({ branches, selectedBranchId, materials, setMaterials, b
             qris,
             deposit,
             notes,
-            matStatus
+            matStatus,
+            branchDrafts: branchDraftsRef.current
         };
+        if (draftClearedRef.current) return;
+        const { matStatus: _ignoredMatStatus, ...draftToStore } = salesDraftRef.current;
+        saveStoredSalesDraft(authUser?.uid, { ...draftToStore, draftVersion: 2 });
     }, [inputBranchId, date, staff1, staff2, stockData, hotTehExtraCount, miloQty, expenseItems, qris, deposit, notes, matStatus]);
 
     useEffect(() => {
@@ -1685,12 +1774,47 @@ function SalesInputView({ branches, selectedBranchId, materials, setMaterials, b
         return getVisibleProductsForBranch(inputBranchId, selectedBranch?.name || '');
     }, [inputBranchId, branches]);
 
-    // Setiap cabang punya stok sendiri. Saat ganti cabang, tabel diisi dengan stok cabang tujuan
-    // (bukan membawa angka cabang sebelumnya), dan Stok Akhir dikosongkan.
+    // Setiap cabang punya isian laporan sendiri (nama pegawai, stok, deposit, QRIS, pengeluaran, dll).
+    // Saat ganti cabang: isian cabang sebelumnya disimpan, lalu isian cabang tujuan dimuat.
+    // Kalau cabang tujuan belum pernah diisi, semuanya kosong dan Stok Awal diambil dari stok cabang itu.
     const lastInputBranchRef = useRef(inputBranchId);
     useEffect(() => {
-        if (lastInputBranchRef.current === inputBranchId) return;
+        const prevBranchId = lastInputBranchRef.current;
+        if (prevBranchId === inputBranchId) return;
         lastInputBranchRef.current = inputBranchId;
+
+        if (prevBranchId) {
+            branchDraftsRef.current = {
+                ...branchDraftsRef.current,
+                [prevBranchId]: { staff1, staff2, stockData, hotTehExtraCount, miloQty, expenseItems, qris, deposit, notes }
+            };
+        }
+
+        const target = branchDraftsRef.current[inputBranchId];
+        if (target) {
+            setStaff1(target.staff1 ?? '');
+            setStaff2(target.staff2 ?? '');
+            setHotTehExtraCount(target.hotTehExtraCount ?? 0);
+            setMiloQty(target.miloQty ?? 0);
+            setExpenseItems(target.expenseItems && target.expenseItems.length > 0 ? target.expenseItems : [{ id: Date.now(), name: '', amount: '' }]);
+            setQris(target.qris ?? 0);
+            setDeposit(target.deposit ?? 0);
+            setNotes(target.notes ?? '');
+            if (target.stockData) {
+                setStockData(target.stockData);
+                return;
+            }
+        } else {
+            setStaff1('');
+            setStaff2('');
+            setHotTehExtraCount(0);
+            setMiloQty(0);
+            setExpenseItems([{ id: Date.now(), name: '', amount: '' }]);
+            setQris(0);
+            setDeposit(0);
+            setNotes('');
+        }
+
         const savedStock = branchMaterialStock[inputBranchId] || {};
         const branchName = branches.find(b => b.id === inputBranchId)?.name || '';
         setStockData(prev => {
@@ -1698,8 +1822,8 @@ function SalesInputView({ branches, selectedBranchId, materials, setMaterials, b
             PRODUCTS_LIST.forEach(p => {
                 next[p.id] = {
                     ...(prev[p.id] || {}),
-                    initial: getSavedCupQty(savedStock, p.id) ?? 0,
-                    final: 0,
+                    initial: getSavedAwalQty(savedStock, p.id) ?? '',
+                    final: '',
                     price: getProductPriceByBranch(p.id, inputBranchId, branchName)
                 };
             });
@@ -1709,7 +1833,7 @@ function SalesInputView({ branches, selectedBranchId, materials, setMaterials, b
 
     // Isi otomatis Stok Awal dari Stok Gelas yang tersimpan (hanya baris yang masih kosong).
     const cupPrefillKey = visibleProducts
-        .map(p => `${p.id}:${getSavedCupQty(branchMaterialStock[inputBranchId] || {}, p.id) ?? ''}`)
+        .map(p => `${p.id}:${getSavedAwalQty(branchMaterialStock[inputBranchId] || {}, p.id) ?? ''}`)
         .join('|');
 
     useEffect(() => {
@@ -1719,11 +1843,11 @@ function SalesInputView({ branches, selectedBranchId, materials, setMaterials, b
             let changed = false;
             const next = { ...prev };
             visibleProducts.forEach(p => {
-                const saved = getSavedCupQty(savedStock, p.id);
+                const saved = getSavedAwalQty(savedStock, p.id);
                 const cur = prev[p.id] || {};
-                if (saved !== null && saved > 0 && !cur.initial && !cur.final) {
+                if (saved !== null && !isStockEntered(cur.initial) && !isStockEntered(cur.final)) {
                     next[p.id] = {
-                        final: 0,
+                        final: '',
                         price: getProductPriceByBranch(p.id, inputBranchId, branchName),
                         ...cur,
                         initial: saved
@@ -1769,33 +1893,50 @@ function SalesInputView({ branches, selectedBranchId, materials, setMaterials, b
         }
     }, [inputBranchId, materials]);
 
-    // Stok Awal yang diketik disimpan otomatis ke Firebase (tunggu 0,8 detik setelah berhenti mengetik)
-    // supaya tetap ada walau halaman ditutup / keluar dari website.
+    // Angka yang diketik disimpan otomatis ke Firebase (tunggu 0,8 detik setelah berhenti mengetik):
+    // - Stok Awal -> disimpan sebagai Stok Awal cabang itu, dan tampil sebagai stok di menu Stok > Perlengkapan
     const setBranchStockRef = useRef(setBranchMaterialStock);
     setBranchStockRef.current = setBranchMaterialStock;
-    const initialSaveTimers = useRef({});
+    const pendingStockWrites = useRef({});
+    const stockWriteTimer = useRef(null);
 
-    const scheduleSaveInitialStock = (pId, qty) => {
-        const branchId = inputBranchId;
-        if (!branchId) return;
-        clearTimeout(initialSaveTimers.current[pId]);
-        initialSaveTimers.current[pId] = setTimeout(() => {
-            setBranchStockRef.current(prev => {
-                const branchMap = { ...(prev[branchId] || {}) };
-                branchMap[getCupStockKey(pId)] = {
+    const flushStockWrites = () => {
+        clearTimeout(stockWriteTimer.current);
+        const pending = Object.values(pendingStockWrites.current);
+        pendingStockWrites.current = {};
+        if (pending.length === 0) return;
+        setBranchStockRef.current(prev => {
+            const next = { ...prev };
+            pending.forEach(({ branchId, key, qty }) => {
+                const branchMap = { ...(next[branchId] || {}) };
+                branchMap[key] = {
                     qty: String(qty),
                     status: 'Aman',
-                    notes: 'Stok awal tersimpan',
+                    notes: 'Stok produk',
                     updatedBy: authUser?.uid || 'system',
                     updatedAt: new Date().toISOString()
                 };
-                return { ...prev, [branchId]: branchMap };
+                next[branchId] = branchMap;
             });
-        }, 800);
+            return next;
+        });
     };
 
+    const scheduleSaveProductStock = (pId, qty, type) => {
+        const branchId = inputBranchId;
+        if (!branchId) return;
+        const key = type === 'awal' ? getAwalStockKey(pId) : getCupStockKey(pId);
+        pendingStockWrites.current[`${branchId}_${key}`] = { branchId, key, qty };
+        clearTimeout(stockWriteTimer.current);
+        stockWriteTimer.current = setTimeout(flushStockWrites, 800);
+    };
+
+    // Kalau pindah halaman sebelum 0,8 detik, tetap simpan yang tertunda.
+    useEffect(() => () => flushStockWrites(), []);
+
     const handleStockChange = (pId, field, val) => {
-        const numVal = Math.max(0, parseInt(val) || 0);
+        const trimmed = String(val).trim();
+        const numVal = trimmed === '' ? '' : Math.max(0, parseInt(trimmed, 10) || 0);
         setStockData(prev => ({
             ...prev,
             [pId]: {
@@ -1803,8 +1944,11 @@ function SalesInputView({ branches, selectedBranchId, materials, setMaterials, b
                 [field]: numVal
             }
         }));
-        if (field === 'initial') {
-            scheduleSaveInitialStock(pId, numVal);
+        // Sebelum laporan disimpan, stok di menu Stok masih mengikuti Stok Awal.
+        // Stok Akhir baru masuk ke menu Stok saat tombol Simpan Laporan ditekan.
+        if (field === 'initial' && numVal !== '') {
+            scheduleSaveProductStock(pId, numVal, 'awal');
+            scheduleSaveProductStock(pId, numVal, 'akhir');
         }
     };
 
@@ -1911,6 +2055,8 @@ function SalesInputView({ branches, selectedBranchId, materials, setMaterials, b
                 const productStock = stockData[product.id] || { initial: 0, final: 0 };
                 return [product.id, {
                     ...productStock,
+                    initial: Number(productStock.initial) || 0,
+                    final: Number(productStock.final) || 0,
                     price: getProductPriceByBranch(product.id, inputBranchId, branches.find(b => b.id === inputBranchId)?.name || '')
                 }];
             })
@@ -1933,12 +2079,19 @@ function SalesInputView({ branches, selectedBranchId, materials, setMaterials, b
             qris: Math.max(0, Number(qris) || 0),
             deposit: Math.max(0, Number(deposit) || 0),
             notes: notes.trim(),
-            materialStatus: Object.fromEntries(
-                Object.entries(branchMaterialStock[inputBranchId] || {}).filter(([materialId]) => !isCupStockKey(materialId)).map(([materialId, value]) => [
-                    materialId,
-                    { qty: value?.qty || '0', status: value?.status || 'Aman' }
-                ])
-            ),
+            materialStatus: {
+                ...Object.fromEntries(
+                    Object.entries(branchMaterialStock[inputBranchId] || {})
+                        .filter(([materialId]) => !isCupStockKey(materialId) && !isHiddenMaterial(materials.find(m => m.id === materialId)))
+                        .map(([materialId, value]) => [materialId, { qty: value?.qty || '0', status: value?.status || 'Aman' }])
+                ),
+                // Stok Akhir gelas/produk ikut masuk ke laporan stok yang dikirim ke Bos.
+                ...Object.fromEntries(
+                    visibleProducts
+                        .filter(p => isStockEntered(stockData[p.id]?.initial) || isStockEntered(stockData[p.id]?.final))
+                        .map(p => [getCupStockKey(p.id), { qty: String(Math.max(0, parseInt(stockData[p.id]?.final, 10) || 0)), status: 'Aman' }])
+                )
+            },
             createdBy: authUser?.uid || 'unknown-user',
             createdByName: authUser?.displayName || staff1.trim() || 'Karyawan',
             createdAt: new Date().toISOString()
@@ -1947,26 +2100,36 @@ function SalesInputView({ branches, selectedBranchId, materials, setMaterials, b
         // Stok bahan HANYA diubah lewat menu Stok. Menyimpan laporan penjualan tidak lagi
         // menulis/menimpa stok cabang (sebelumnya menyebarkan semua bahan ke semua cabang).
 
-        // Stok Akhir otomatis masuk ke Stok > Perlengkapan (hanya produk yang diisi hari ini).
+        // Buang simpanan otomatis yang masih tertunda, lalu simpan hasil akhir:
+        // Stok Akhir -> stok di Stok > Perlengkapan, dan jadi Stok Awal untuk laporan berikutnya.
+        clearTimeout(stockWriteTimer.current);
+        pendingStockWrites.current = {};
         const trackedProducts = visibleProducts.filter(p => {
             const row = stockData[p.id] || {};
-            return (Number(row.initial) || 0) > 0 || (Number(row.final) || 0) > 0;
+            return isStockEntered(row.initial) || isStockEntered(row.final);
         });
         if (trackedProducts.length > 0) {
             setBranchMaterialStock(prev => {
                 const branchMap = { ...(prev[inputBranchId] || {}) };
                 trackedProducts.forEach(p => {
-                    branchMap[getCupStockKey(p.id)] = {
+                    const entry = {
                         qty: String(Math.max(0, parseInt(stockData[p.id]?.final, 10) || 0)),
                         status: 'Aman',
-                        notes: 'Stok gelas',
+                        notes: 'Stok produk',
                         updatedBy: authUser?.uid || 'system',
                         updatedAt: new Date().toISOString()
                     };
+                    branchMap[getCupStockKey(p.id)] = entry;
+                    branchMap[getAwalStockKey(p.id)] = entry;
                 });
                 return { ...prev, [inputBranchId]: branchMap };
             });
         }
+
+        // Form di-reset setelah laporan disimpan (Stok Awal besok diambil dari Stok Akhir di atas).
+        draftClearedRef.current = true;
+        branchDraftsRef.current = {};
+        clearStoredSalesDraft(authUser?.uid);
 
         onSaveLog(newLog);
     };
@@ -2045,9 +2208,6 @@ function SalesInputView({ branches, selectedBranchId, materials, setMaterials, b
                     <i className="fa-solid fa-cup-straw text-amber-700"></i>
                     2. Input Stok Awal & Stok Akhir Gelas
                 </h3>
-                <p className="text-[11px] text-emerald-700 font-semibold -mt-2">
-                    Stok Awal yang Anda isi tersimpan otomatis, jadi tetap ada walau keluar dari website. Bisa diubah kapan saja kalau ada penambahan. Setelah laporan disimpan, Stok Akhir otomatis masuk ke menu Stok → Perlengkapan dan jadi Stok Awal berikutnya.
-                </p>
 
                 <div className="overflow-x-auto">
                     <table className="w-full text-left border-collapse stock-table">
@@ -2079,7 +2239,7 @@ function SalesInputView({ branches, selectedBranchId, materials, setMaterials, b
                                             <input 
                                                 type="number" 
                                                 min="0"
-                                                value={emptyIfZero(stockData[p.id]?.initial)}
+                                                value={stockData[p.id]?.initial ?? ''}
                                                 onChange={(e) => handleStockChange(p.id, 'initial', e.target.value)}
                                                 className="w-16 bg-gray-50 border border-gray-300 rounded-lg p-1.5 font-bold text-center focus:bg-white focus:ring-2 focus:ring-amber-500 stock-input"
                                             />
@@ -2088,7 +2248,7 @@ function SalesInputView({ branches, selectedBranchId, materials, setMaterials, b
                                             <input 
                                                 type="number" 
                                                 min="0"
-                                                value={emptyIfZero(stockData[p.id]?.final)}
+                                                value={stockData[p.id]?.final ?? ''}
                                                 onChange={(e) => handleStockChange(p.id, 'final', e.target.value)}
                                                 className={`w-16 bg-gray-50 border rounded-lg p-1.5 font-bold text-center focus:bg-white focus:ring-2 focus:ring-amber-500 stock-input ${hasStockWarning ? 'border-rose-400' : 'border-gray-300'}`}
                                             />
@@ -2118,10 +2278,10 @@ function SalesInputView({ branches, selectedBranchId, materials, setMaterials, b
                         <div>
                             <h4 className="font-extrabold text-xs text-amber-950 uppercase tracking-wider flex items-center gap-1.5">
                                 <i className="fa-solid fa-mug-hot text-amber-700"></i>
-                                Aturan Tambahan Harga Teh Tarik Panas (+Rp 5.000)
+                                Tambahan Teh Panas (+Rp 5.000)
                             </h4>
                             <p className="text-xs text-amber-800/90 mt-0.5">
-                                Harga dasar Gelas Panas = Rp10.000. Jika pelanggan minta Teh Panas memakai <strong>Gelas Besar / Gelas Kecil</strong>, terdapat tambahan harga Rp 5.000 (Total Rp15.000).
+                                Teh panas pakai Gelas Besar/Kecil: tambah Rp5.000 per porsi.
                             </p>
                         </div>
                         <div className="flex items-center gap-2 whitespace-nowrap">
@@ -2137,12 +2297,12 @@ function SalesInputView({ branches, selectedBranchId, materials, setMaterials, b
                     </div>
                     {calculated.hotTehExtraSubtotal > 0 && (
                         <div className="text-right text-xs font-black text-amber-900 border-t border-amber-200/60 pt-2">
-                            Subtotal Tambahan Teh Tarik Panas ({hotTehExtraCount} porsi × Rp5.000): +{formatRp(calculated.hotTehExtraSubtotal)}
+                            Tambahan Teh Panas ({hotTehExtraCount} porsi): {formatRp(calculated.hotTehExtraSubtotal)}
                         </div>
                     )}
                     {calculated.miloCharge > 0 && (
                         <div className="text-right text-xs font-black text-amber-900 border-t border-amber-200/60 pt-2">
-                            Tambahan Milo: +{formatRp(calculated.miloCharge)}
+                            Tambahan Milo: {formatRp(calculated.miloCharge)}
                         </div>
                     )}
                 </div>
@@ -2173,7 +2333,7 @@ function SalesInputView({ branches, selectedBranchId, materials, setMaterials, b
                     <div className="space-y-3.5">
                         <div>
                             <label className="block text-xs font-bold text-gray-700 mb-1">
-                                Deposit Kas Masuk (Rp)
+                                Deposit
                             </label>
                             <div className="relative">
                                 <span className="absolute left-3 top-2.5 text-xs font-bold text-gray-400">Rp</span>
@@ -2189,7 +2349,7 @@ function SalesInputView({ branches, selectedBranchId, materials, setMaterials, b
 
                         <div>
                             <label className="block text-xs font-bold text-gray-700 mb-1">
-                                Total Pembayaran Non-Tunai / QRIS (Rp)
+                                QRIS
                             </label>
                             <div className="relative">
                                 <span className="absolute left-3 top-2.5 text-xs font-bold text-gray-400">Rp</span>
@@ -2269,14 +2429,16 @@ function SalesInputView({ branches, selectedBranchId, materials, setMaterials, b
                                 <span>Total Penjualan Produk:</span>
                                 <span className="font-bold text-white">{formatRp(calculated.baseGross)}</span>
                             </div>
-                            <div className="flex justify-between text-amber-200">
-                                <span>Tambahan Teh Tarik Panas:</span>
-                                <span className="font-bold">+{formatRp(calculated.hotTehExtraSubtotal)}</span>
-                            </div>
+                            {calculated.hotTehExtraSubtotal > 0 && (
+                                <div className="flex justify-between text-amber-200">
+                                    <span>Tambahan Teh Tarik Panas:</span>
+                                    <span className="font-bold">{formatRp(calculated.hotTehExtraSubtotal)}</span>
+                                </div>
+                            )}
                             {calculated.miloCharge > 0 && (
                                 <div className="flex justify-between text-amber-200">
                                     <span>Tambahan Milo:</span>
-                                    <span className="font-bold">+{formatRp(calculated.miloCharge)}</span>
+                                    <span className="font-bold">{formatRp(calculated.miloCharge)}</span>
                                 </div>
                             )}
                             <div className="flex justify-between text-emerald-300 font-bold border-t border-brand-800 pt-2">
@@ -2288,12 +2450,12 @@ function SalesInputView({ branches, selectedBranchId, materials, setMaterials, b
                                 <span className="font-bold">{formatRp(deposit)}</span>
                             </div>
                             <div className="flex justify-between text-rose-300">
-                                <span>Pengeluaran (-)</span>
-                                <span className="font-bold">-{formatRp(calculated.totalExpenses)}</span>
+                                <span>Pengeluaran</span>
+                                <span className="font-bold">{formatRp(calculated.totalExpenses)}</span>
                             </div>
                             <div className="flex justify-between text-blue-300">
-                                <span>QRIS (-)</span>
-                                <span className="font-bold">-{formatRp(qris)}</span>
+                                <span>QRIS</span>
+                                <span className="font-bold">{formatRp(qris)}</span>
                             </div>
                         </div>
 
@@ -2372,6 +2534,7 @@ function InventoryView({ branches, selectedBranchId, materials, setMaterials, br
 
             materials.forEach(item => {
                 if ((item.category || categoryKey) !== categoryKey) return;
+                if (isHiddenMaterial(item)) return;
                 // Hindari dobel: item lama bernama sama dengan produk (mis. "Gelas Panas") disembunyikan.
                 if (categoryKey === 'perlengkapan' && productNames.has(String(item.name || '').trim().toLowerCase())) return;
                 if (!Object.prototype.hasOwnProperty.call(branchStock, item.id)) return;
@@ -2402,6 +2565,20 @@ function InventoryView({ branches, selectedBranchId, materials, setMaterials, br
                 ...prev,
                 [activeBranchId]: currentBranchMap
             };
+        });
+    };
+
+    // Koreksi/penambahan manual jumlah produk di Perlengkapan: ikut jadi Stok Awal laporan berikutnya.
+    const handleUpdateProductStock = (stockKey, value) => {
+        if (isAdminView) return;
+        const productId = stockKey.slice(CUP_STOCK_PREFIX.length);
+        setBranchMaterialStock(prev => {
+            const currentBranchMap = { ...(prev[activeBranchId] || {}) };
+            const entry = { status: 'Aman', notes: '', qty: value, updatedAt: new Date().toISOString() };
+            currentBranchMap[stockKey] = { ...(currentBranchMap[stockKey] || {}), ...entry };
+            const awalKey = getAwalStockKey(productId);
+            currentBranchMap[awalKey] = { ...(currentBranchMap[awalKey] || {}), ...entry };
+            return { ...prev, [activeBranchId]: currentBranchMap };
         });
     };
 
@@ -2606,7 +2783,7 @@ function InventoryView({ branches, selectedBranchId, materials, setMaterials, br
                                                                     type="text"
                                                                     inputMode="numeric"
                                                                     value={data.qty ?? ''}
-                                                                    onChange={(e) => handleUpdateMaterial(m.id, 'qty', e.target.value.replace(/\D/g, ''))}
+                                                                    onChange={(e) => handleUpdateProductStock(m.id, e.target.value.replace(/\D/g, ''))}
                                                                     placeholder="0"
                                                                     className="w-full bg-transparent border-0 p-0 text-xs font-bold text-brand-950 placeholder:text-gray-400 focus:outline-none focus:ring-0"
                                                                 />
@@ -2745,7 +2922,10 @@ function HistoryView({ branches, selectedBranchId, salesLogs, setSalesLogs, getB
             const matchDate = !dateFilter || log.date === dateFilter;
             const matchPeriod = periodFilter === 'all' || matchesPeriod(log.date, periodFilter);
             return matchBranch && matchDate && matchPeriod;
-        });
+        }).sort((a, b) =>
+            String(b.date || '').localeCompare(String(a.date || '')) ||
+            String(b.createdAt || '').localeCompare(String(a.createdAt || ''))
+        );
     }, [salesLogs, selectedBranchId, dateFilter, periodFilter, role, currentUserId]);
 
     const canDeleteLog = role === 'admin';
@@ -3136,22 +3316,36 @@ function ReportExportModal({ log, branchName, materials, branchMaterialStock = {
     const materialStatusMap = log.materialStatus && Object.keys(log.materialStatus).length > 0 ? log.materialStatus : fallbackStock;
     const stockRows = Object.entries(materialStatusMap || {})
         .filter(([mId, value]) => {
-            if (isCupStockKey(mId)) return false;
+            if (String(mId).startsWith(AWAL_STOCK_PREFIX)) return false;
             const rawQty = typeof value === 'string' ? value : (value?.qty ?? '');
             const cleanQty = String(rawQty ?? '').trim();
+            if (String(mId).startsWith(CUP_STOCK_PREFIX)) return cleanQty !== '';
+            if (isHiddenMaterial(materials.find((item) => item.id === mId))) return false;
             return cleanQty !== '' && cleanQty !== '0' && cleanQty.toLowerCase() !== 'belum ada catatan';
         })
         .map(([mId, value]) => {
-            const material = materials.find((item) => item.id === mId);
             const qtyValue = typeof value === 'string' ? value : (value?.qty ?? '');
             const qtyLabel = String(qtyValue ?? '').trim();
 
+            if (String(mId).startsWith(CUP_STOCK_PREFIX)) {
+                const productId = String(mId).slice(CUP_STOCK_PREFIX.length);
+                const product = PRODUCTS_LIST.find((p) => p.id === productId);
+                return {
+                    id: mId,
+                    name: product?.name || productId,
+                    qty: `${qtyLabel} ${PRODUCT_STOCK_UNITS[productId] || 'cup'}`,
+                    isProduct: true
+                };
+            }
+
+            const material = materials.find((item) => item.id === mId);
             return {
                 id: mId,
                 name: material?.name || mId,
                 qty: qtyLabel
             };
-        });
+        })
+        .sort((x, y) => Number(Boolean(y.isProduct)) - Number(Boolean(x.isProduct)));
 
     const deposit = Math.max(0, Number(log.deposit) || 0);
     const expenses = Math.max(0, Number(log.expenses) || 0);
