@@ -549,6 +549,12 @@ const emptyIfZero = (value) => {
     return (value === 0 || value === '0' || value === '0.0') ? '' : value;
 };
 
+// Tanggal hari ini menurut jam perangkat (bukan UTC, supaya dini hari tidak terbaca kemarin).
+const getTodayLocal = () => {
+    const now = new Date();
+    return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+};
+
 // Kolom stok: '' = belum diisi, 0 = sengaja diisi nol (produk tidak dijual).
 const isStockEntered = (value) => value !== '' && value !== null && value !== undefined;
 
@@ -861,6 +867,7 @@ function App() {
     // belum lengkap (misalnya baru buka aplikasi / baru ganti perangkat).
     // Item stok hanya akan terhapus dari Firestore jika memang secara eksplisit
     // dihilangkan dari objek berikutnya (misalnya lewat tombol hapus di Menu Stok).
+    const stockErrorToastAtRef = useRef(0);
     const setBranchMaterialStockSafe = (updater) => {
         const prevBranchMaterialStock = branchMaterialStock;
         const next = typeof updater === 'function' ? updater(prevBranchMaterialStock) : updater;
@@ -908,6 +915,16 @@ function App() {
         if (Object.keys(changedMap).length > 0) {
             upsertBranchMaterialStock(changedMap).catch((error) => {
                 console.error('stock save error from state update', error);
+                // Beri tahu pengguna kalau stok gagal tersimpan ke server (maks. sekali per 15 detik).
+                if (Date.now() - stockErrorToastAtRef.current > 15000) {
+                    stockErrorToastAtRef.current = Date.now();
+                    showToast(
+                        error?.code === 'permission-denied'
+                            ? 'Stok DITOLAK server (izin akses Firestore). Hubungi admin untuk memeriksa Rules.'
+                            : 'Stok belum tersimpan ke server. Periksa koneksi internet lalu coba lagi.',
+                        'error'
+                    );
+                }
             });
         }
 
@@ -1695,7 +1712,7 @@ function SalesInputView({ branches, selectedBranchId, materials, setMaterials, b
 
         return {
             inputBranchId: branchId || (branches[0]?.id || ''),
-            date: new Date().toISOString().split('T')[0],
+            date: getTodayLocal(),
             staff1: '',
             staff2: '',
             stockData: initialStockData,
@@ -1712,7 +1729,9 @@ function SalesInputView({ branches, selectedBranchId, materials, setMaterials, b
         const saved = salesDraftRef?.current;
         return saved?.inputBranchId || (selectedBranchId !== 'ALL' ? selectedBranchId : (branches[0]?.id || ''));
     });
-    const [date, setDate] = useState(() => salesDraftRef?.current?.date || new Date().toISOString().split('T')[0]);
+    // Tanggal otomatis hari ini, kecuali pengguna mengubahnya sendiri (dateManual).
+    const dateManualRef = useRef(Boolean(salesDraftRef?.current?.dateManual && salesDraftRef?.current?.date));
+    const [date, setDate] = useState(() => (dateManualRef.current ? salesDraftRef.current.date : getTodayLocal()));
     const [staff1, setStaff1] = useState(() => salesDraftRef?.current?.staff1 || '');
     const [staff2, setStaff2] = useState(() => salesDraftRef?.current?.staff2 || '');
     const [stockData, setStockData] = useState(() => salesDraftRef?.current?.stockData || createBlankDraft(selectedBranchId !== 'ALL' ? selectedBranchId : (branches[0]?.id || '')).stockData);
@@ -1728,7 +1747,7 @@ function SalesInputView({ branches, selectedBranchId, materials, setMaterials, b
         const saved = salesDraftRef?.current;
         if (saved && Object.keys(saved).length > 0) {
             if (saved.inputBranchId) setInputBranchId(saved.inputBranchId);
-            if (saved.date) setDate(saved.date);
+            if (saved.dateManual && saved.date) setDate(saved.date);
             if (saved.staff1 !== undefined) setStaff1(saved.staff1);
             if (saved.staff2 !== undefined) setStaff2(saved.staff2);
             if (saved.stockData) setStockData(saved.stockData);
@@ -1746,6 +1765,7 @@ function SalesInputView({ branches, selectedBranchId, materials, setMaterials, b
         salesDraftRef.current = {
             inputBranchId,
             date,
+            dateManual: dateManualRef.current,
             staff1,
             staff2,
             stockData,
@@ -1773,6 +1793,18 @@ function SalesInputView({ branches, selectedBranchId, materials, setMaterials, b
         const selectedBranch = branches.find(b => b.id === inputBranchId);
         return getVisibleProductsForBranch(inputBranchId, selectedBranch?.name || '');
     }, [inputBranchId, branches]);
+
+    // Perbarui tanggal ke hari ini saat form dibuka lagi (mis. besok harinya), selama tidak diubah manual.
+    useEffect(() => {
+        const syncToday = () => {
+            if (dateManualRef.current) return;
+            const today = getTodayLocal();
+            setDate(prev => (prev === today ? prev : today));
+        };
+        syncToday();
+        document.addEventListener('visibilitychange', syncToday);
+        return () => document.removeEventListener('visibilitychange', syncToday);
+    }, []);
 
     // Setiap cabang punya isian laporan sendiri (nama pegawai, stok, deposit, QRIS, pengeluaran, dll).
     // Saat ganti cabang: isian cabang sebelumnya disimpan, lalu isian cabang tujuan dimuat.
@@ -2172,7 +2204,7 @@ function SalesInputView({ branches, selectedBranchId, materials, setMaterials, b
                         <input 
                             type="date"
                             value={date}
-                            onChange={(e) => setDate(e.target.value)}
+                            onChange={(e) => { dateManualRef.current = true; setDate(e.target.value); }}
                             className="w-full bg-brand-50 border border-brand-300 rounded-xl px-3 py-2 text-sm font-bold text-brand-950 focus:ring-2 focus:ring-amber-500"
                             required
                         />
@@ -2235,7 +2267,7 @@ function SalesInputView({ branches, selectedBranchId, materials, setMaterials, b
                                             {p.name}
                                         </td>
                                         <td className="p-3 text-gray-600 font-semibold stock-price">{formatRp(price)}</td>
-                                        <td className="p-3 stock-input-cell">
+                                        <td className="p-3 stock-input-cell" data-label="Stok Awal">
                                             <input 
                                                 type="number" 
                                                 min="0"
@@ -2244,7 +2276,7 @@ function SalesInputView({ branches, selectedBranchId, materials, setMaterials, b
                                                 className="w-16 bg-gray-50 border border-gray-300 rounded-lg p-1.5 font-bold text-center focus:bg-white focus:ring-2 focus:ring-amber-500 stock-input"
                                             />
                                         </td>
-                                        <td className="p-3 stock-input-cell">
+                                        <td className="p-3 stock-input-cell" data-label="Stok Akhir">
                                             <input 
                                                 type="number" 
                                                 min="0"
@@ -2258,12 +2290,12 @@ function SalesInputView({ branches, selectedBranchId, materials, setMaterials, b
                                                 </span>
                                             )}
                                         </td>
-                                        <td className="p-3 text-center stock-sold-cell">
+                                        <td className="p-3 text-center stock-sold-cell" data-label="Terjual">
                                             <span className={`font-extrabold px-3 py-1 rounded-full text-xs stock-sold ${hasStockWarning ? 'text-rose-900 bg-rose-100' : 'text-amber-900 bg-amber-100'}`}>
                                                 {calc.sold}
                                             </span>
                                         </td>
-                                        <td className="p-3 text-right font-black text-brand-900 stock-subtotal">
+                                        <td className="p-3 text-right font-black text-brand-900 stock-subtotal" data-label="Subtotal">
                                             {formatRp(calc.subtotal)}
                                         </td>
                                     </tr>
