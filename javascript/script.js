@@ -191,6 +191,15 @@ if (!firestoreDb) {
     console.warn('Firestore instance is not ready yet.');
 }
 
+// Mode sinyal jelek: data yang disimpan ditahan di HP (IndexedDB) lalu dikirim ke server
+// otomatis begitu sinyal kembali. Kalau browser tidak mendukung, aplikasi tetap jalan seperti biasa.
+let offlinePersistenceActive = false;
+if (firestoreDb && typeof firestoreDb.enablePersistence === 'function') {
+    firestoreDb.enablePersistence({ synchronizeTabs: true })
+        .then(() => { offlinePersistenceActive = true; })
+        .catch((error) => { console.warn('Penyimpanan offline tidak aktif:', error && error.code ? error.code : error); });
+}
+
 const normalizeFirestoreDoc = (doc) => ({ id: doc.id, ...(doc.data ? doc.data() : {}) });
 
 const normalizeBranchStockMap = (snapshot) => {
@@ -235,6 +244,14 @@ const upsertArrayCollection = async (collectionName, records) => {
         console.error('Firestore save error for collection:', collectionName, error);
         throw error;
     }
+};
+
+// Menyimpan SATU laporan baru saja. Tidak membaca atau menghapus laporan lain,
+// jadi aman walau data di layar belum lengkap atau sinyal sedang jelek.
+const saveSalesLogDocument = (log) => {
+    if (!firestoreDb || !log || !log.id) return Promise.resolve();
+    const { id, ...rest } = log;
+    return firestoreDb.collection(FIRESTORE_COLLECTIONS.salesLogs).doc(id).set(rest, { merge: true });
 };
 
 // PENTING: fungsi ini HANYA melakukan upsert (create/update) pada dokumen yang
@@ -868,6 +885,24 @@ function App() {
     // Item stok hanya akan terhapus dari Firestore jika memang secara eksplisit
     // dihilangkan dari objek berikutnya (misalnya lewat tombol hapus di Menu Stok).
     const stockErrorToastAtRef = useRef(0);
+
+    const [isOnline, setIsOnline] = useState(typeof navigator === 'undefined' ? true : navigator.onLine);
+    useEffect(() => {
+        const goOnline = () => {
+            setIsOnline(true);
+            showToast('Sinyal kembali. Data yang tertahan dikirim otomatis.');
+        };
+        const goOffline = () => {
+            setIsOnline(false);
+            showToast('Tidak ada sinyal. Anda tetap bisa mengisi dan menyimpan laporan.', 'error');
+        };
+        window.addEventListener('online', goOnline);
+        window.addEventListener('offline', goOffline);
+        return () => {
+            window.removeEventListener('online', goOnline);
+            window.removeEventListener('offline', goOffline);
+        };
+    }, []);
     const setBranchMaterialStockSafe = (updater) => {
         const prevBranchMaterialStock = branchMaterialStock;
         const next = typeof updater === 'function' ? updater(prevBranchMaterialStock) : updater;
@@ -1232,7 +1267,7 @@ function App() {
                                     onChange={(e) => setSelectedBranchId(e.target.value)}
                                     className="bg-brand-950 text-amber-50 font-extrabold text-[9px] sm:text-xs md:text-sm rounded-md px-1.5 py-1 focus:outline-none focus:ring-2 focus:ring-amberGold border border-brand-700 w-full min-w-0 cursor-pointer"
                                 >
-                                    <option value="ALL">Semua Cabang</option>
+                                    <option value="ALL" disabled={!isAdmin}>{isAdmin ? 'Semua Cabang' : '-- Pilih cabang --'}</option>
                                     {branches.map(b => (
                                         <option key={b.id} value={b.id}>
                                             {b.name}
@@ -1327,6 +1362,13 @@ function App() {
             )}
 
             <main className="app-main flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6">
+                {!isOnline && (
+                    <div className="mb-4 px-4 py-2.5 rounded-2xl bg-amber-100 border border-amber-300 text-amber-900 text-xs font-bold">
+                        {offlinePersistenceActive
+                            ? '📴 Tidak ada sinyal. Laporan yang disimpan tetap aman di HP dan terkirim otomatis saat sinyal kembali.'
+                            : '📴 Tidak ada sinyal. Jangan tutup halaman ini sampai sinyal kembali, supaya laporan terkirim.'}
+                    </div>
+                )}
                 {currentTab === 'dashboard' && isAdmin && (
                     <DashboardView 
                         branches={branches}
@@ -1348,10 +1390,28 @@ function App() {
                         setBranchMaterialStock={setBranchMaterialStockSafe}
                         authUser={authUser}
                         salesDraftRef={salesDraftRef}
+                        onBranchChosen={setSelectedBranchId}
                         onSaveLog={(newLog) => {
-                            setSalesLogsSafe(prev => [newLog, ...prev]);
+                            setSalesLogs(prev => [newLog, ...prev]);
+                            saveSalesLogDocument(newLog).catch((error) => {
+                                console.error('salesLogs Firestore write failed:', error);
+                                showToast(
+                                    error && error.code === 'permission-denied'
+                                        ? 'Laporan DITOLAK server (izin akses Firestore). Hubungi admin.'
+                                        : 'Laporan belum terkirim ke server. Periksa koneksi lalu coba simpan ulang.',
+                                    'error'
+                                );
+                            });
                             salesDraftRef.current = {};
-                            showToast('Laporan penjualan harian berhasil disimpan!');
+                            if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+                                showToast(
+                                    offlinePersistenceActive
+                                        ? 'Tidak ada sinyal. Laporan disimpan di HP dan terkirim otomatis saat sinyal kembali.'
+                                        : 'Tidak ada sinyal. Laporan terkirim saat sinyal kembali, jangan tutup halaman ini.'
+                                );
+                            } else {
+                                showToast('Laporan penjualan harian berhasil disimpan!');
+                            }
                             setCurrentTab('history');
                         }}
                         showToast={showToast}
@@ -1539,6 +1599,13 @@ function DashboardView({ branches, selectedBranchId, salesLogs, getBranchName, o
         return Array.from(bucketMap.values()).sort((a, b) => a.sortKey.localeCompare(b.sortKey));
     }, [filteredLogs, chartRange]);
 
+    const todayString = getTodayLocal();
+    const reportStatus = useMemo(() => {
+        const targetBranches = selectedBranchId === 'ALL' ? branches : branches.filter(b => b.id === selectedBranchId);
+        const reportedIds = new Set(salesLogs.filter(l => l.date === todayString).map(l => l.branchId));
+        return { missing: targetBranches.filter(b => !reportedIds.has(b.id)), total: targetBranches.length };
+    }, [branches, salesLogs, selectedBranchId, todayString]);
+
     return (
         <div className="space-y-6">
             <div className="bg-gradient-to-r from-brand-950 via-darkRoast to-brand-900 p-6 rounded-3xl text-white shadow-xl border border-amberGold/40 flex flex-col md:flex-row md:items-center justify-between gap-5 relative overflow-hidden">
@@ -1565,6 +1632,18 @@ function DashboardView({ branches, selectedBranchId, salesLogs, getBranchName, o
                     </button>
                 )}
             </div>
+
+            {reportStatus.total > 0 && (
+                reportStatus.missing.length === 0 ? (
+                    <div className="px-4 py-2.5 rounded-2xl bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs font-bold">
+                        ✅ {selectedBranchId === 'ALL' ? 'Semua cabang' : 'Cabang ini'} sudah lapor hari ini
+                    </div>
+                ) : (
+                    <div className="px-4 py-2.5 rounded-2xl bg-amber-50 border border-amber-200 text-amber-900 text-xs font-bold">
+                        ⏳ Belum lapor hari ini: {reportStatus.missing.map(b => b.name).join(', ')}
+                    </div>
+                )
+            )}
 
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
                 <div className="bg-white p-5 rounded-2xl shadow-sm border border-brand-200/80">
@@ -1681,7 +1760,7 @@ function DashboardView({ branches, selectedBranchId, salesLogs, getBranchName, o
     );
 }
 
-function SalesInputView({ branches, selectedBranchId, materials, setMaterials, branchMaterialStock, setBranchMaterialStock, authUser, onSaveLog, showToast, salesDraftRef }) {
+function SalesInputView({ branches, selectedBranchId, materials, setMaterials, branchMaterialStock, setBranchMaterialStock, authUser, onSaveLog, showToast, salesDraftRef, onBranchChosen }) {
     // Ambil kembali draft yang tersimpan di browser (kalau halaman baru dibuka ulang).
     if (salesDraftRef && (!salesDraftRef.current || Object.keys(salesDraftRef.current).length === 0)) {
         const storedDraft = loadStoredSalesDraft(authUser?.uid);
@@ -1727,21 +1806,22 @@ function SalesInputView({ branches, selectedBranchId, materials, setMaterials, b
 
     const [inputBranchId, setInputBranchId] = useState(() => {
         const saved = salesDraftRef?.current;
-        return saved?.inputBranchId || (selectedBranchId !== 'ALL' ? selectedBranchId : (branches[0]?.id || ''));
+        // Tidak lagi otomatis memilih cabang pertama: kalau belum dipilih, harus dipilih dulu.
+        return saved?.inputBranchId || (selectedBranchId !== 'ALL' ? selectedBranchId : (branches.length === 1 ? branches[0].id : ''));
     });
     // Tanggal otomatis hari ini, kecuali pengguna mengubahnya sendiri (dateManual).
     const dateManualRef = useRef(Boolean(salesDraftRef?.current?.dateManual && salesDraftRef?.current?.date));
     const [date, setDate] = useState(() => (dateManualRef.current ? salesDraftRef.current.date : getTodayLocal()));
     const [staff1, setStaff1] = useState(() => salesDraftRef?.current?.staff1 || '');
     const [staff2, setStaff2] = useState(() => salesDraftRef?.current?.staff2 || '');
-    const [stockData, setStockData] = useState(() => salesDraftRef?.current?.stockData || createBlankDraft(selectedBranchId !== 'ALL' ? selectedBranchId : (branches[0]?.id || '')).stockData);
+    const [stockData, setStockData] = useState(() => salesDraftRef?.current?.stockData || createBlankDraft(selectedBranchId !== 'ALL' ? selectedBranchId : (branches.length === 1 ? branches[0].id : '')).stockData);
     const [hotTehExtraCount, setHotTehExtraCount] = useState(() => salesDraftRef?.current?.hotTehExtraCount || 0);
     const [miloQty, setMiloQty] = useState(() => salesDraftRef?.current?.miloQty || 0);
     const [expenseItems, setExpenseItems] = useState(() => salesDraftRef?.current?.expenseItems || [{ id: Date.now(), name: '', amount: '' }]);
     const [qris, setQris] = useState(() => salesDraftRef?.current?.qris || 0);
     const [deposit, setDeposit] = useState(() => salesDraftRef?.current?.deposit || 0);
     const [notes, setNotes] = useState(() => salesDraftRef?.current?.notes || '');
-    const [matStatus, setMatStatus] = useState(() => salesDraftRef?.current?.matStatus || createBlankDraft(selectedBranchId !== 'ALL' ? selectedBranchId : (branches[0]?.id || '')).matStatus);
+    const [matStatus, setMatStatus] = useState(() => salesDraftRef?.current?.matStatus || createBlankDraft(selectedBranchId !== 'ALL' ? selectedBranchId : (branches.length === 1 ? branches[0].id : '')).matStatus);
 
     useEffect(() => {
         const saved = salesDraftRef?.current;
@@ -1814,6 +1894,10 @@ function SalesInputView({ branches, selectedBranchId, materials, setMaterials, b
         const prevBranchId = lastInputBranchRef.current;
         if (prevBranchId === inputBranchId) return;
         lastInputBranchRef.current = inputBranchId;
+
+        // Pertama kali memilih cabang: isian yang sudah diketik dipertahankan
+        // (Stok Awal yang masih kosong terisi otomatis dari stok cabang itu).
+        if (!prevBranchId) return;
 
         if (prevBranchId) {
             branchDraftsRef.current = {
@@ -2114,7 +2198,15 @@ function SalesInputView({ branches, selectedBranchId, materials, setMaterials, b
             materialStatus: {
                 ...Object.fromEntries(
                     Object.entries(branchMaterialStock[inputBranchId] || {})
-                        .filter(([materialId]) => !isCupStockKey(materialId) && !isHiddenMaterial(materials.find(m => m.id === materialId)))
+                        .filter(([materialId]) => {
+                            if (isCupStockKey(materialId)) return false;
+                            const material = materials.find(m => m.id === materialId);
+                            if (isHiddenMaterial(material)) return false;
+                            // Item lama bernama sama dengan produk jualan (mis. "gelas besar") tidak ikut,
+                            // karena stok produk sudah otomatis dari Stok Akhir.
+                            const materialName = String(material?.name || '').trim().toLowerCase();
+                            return !(materialName && visibleProducts.some(p => p.name.trim().toLowerCase() === materialName));
+                        })
                         .map(([materialId, value]) => [materialId, { qty: value?.qty || '0', status: value?.status || 'Aman' }])
                 ),
                 // Stok Akhir gelas/produk ikut masuk ke laporan stok yang dikirim ke Bos.
@@ -2189,14 +2281,23 @@ function SalesInputView({ branches, selectedBranchId, materials, setMaterials, b
                         <label className="block text-xs font-bold text-gray-700 mb-1">Lokasi/Cabang Berjualan</label>
                         <select
                             value={inputBranchId}
-                            onChange={(e) => setInputBranchId(e.target.value)}
-                            className="w-full bg-brand-50 border border-brand-300 rounded-xl px-3 py-2 text-sm font-bold text-brand-950 focus:ring-2 focus:ring-amber-500"
+                            onChange={(e) => {
+                                setInputBranchId(e.target.value);
+                                if (e.target.value && onBranchChosen) onBranchChosen(e.target.value);
+                            }}
+                            className={`w-full bg-brand-50 border rounded-xl px-3 py-2 text-sm font-bold text-brand-950 focus:ring-2 focus:ring-amber-500 ${inputBranchId ? 'border-brand-300' : 'border-rose-400 ring-2 ring-rose-200'}`}
                             required
                         >
+                            <option value="">-- Pilih cabang --</option>
                             {branches.map(b => (
                                 <option key={b.id} value={b.id}>📍 {b.name}</option>
                             ))}
                         </select>
+                        {!inputBranchId && (
+                            <p className="mt-1 text-[11px] font-bold text-rose-600">
+                                ⚠ Pilih cabang dulu. Bagian di bawah baru bisa diisi.
+                            </p>
+                        )}
                     </div>
 
                     <div>
@@ -2235,13 +2336,14 @@ function SalesInputView({ branches, selectedBranchId, materials, setMaterials, b
                 </div>
             </div>
 
+            <fieldset disabled={!inputBranchId} className={`space-y-6 min-w-0 border-0 p-0 m-0 ${!inputBranchId ? 'opacity-50' : ''}`}>
             <div className="bg-white p-5 rounded-3xl border border-brand-200/80 shadow-sm space-y-4">
                 <h3 className="font-extrabold text-sm text-brand-950 border-b border-brand-100 pb-2.5 flex items-center gap-2">
                     <i className="fa-solid fa-cup-straw text-amber-700"></i>
                     2. Input Stok Awal & Stok Akhir Gelas
                 </h3>
 
-                <div className="overflow-x-auto">
+                <div className="overflow-x-auto stock-table-wrap">
                     <table className="w-full text-left border-collapse stock-table">
                         <thead>
                             <tr className="bg-brand-50/80 text-brand-900 text-xs font-extrabold uppercase tracking-wider">
@@ -2508,10 +2610,11 @@ function SalesInputView({ branches, selectedBranchId, materials, setMaterials, b
                         className="w-full mt-6 bg-gradient-to-r from-amberGold to-amber-500 hover:from-amber-400 hover:to-amberGold text-brand-950 font-black py-4 px-4 rounded-2xl shadow-xl transition transform active:scale-95 flex items-center justify-center gap-2 text-base"
                     >
                         <i className="fa-solid fa-floppy-disk text-lg"></i>
-                        Simpan Laporan Harian
+                        Simpan Laporan Harian{inputBranchId ? ` · ${branches.find(b => b.id === inputBranchId)?.name || ''}` : ''}
                     </button>
                 </div>
             </div>
+            </fieldset>
 
         </form>
     );
@@ -2677,6 +2780,18 @@ function InventoryView({ branches, selectedBranchId, materials, setMaterials, br
     const readOnlyNotice = isAdminView
         ? 'Mode lihat stok saja: hanya menampilkan bahan yang sudah diisi kondisinya oleh karyawan (item kosong/belum diisi disembunyikan).'
         : 'Isi kondisi stok dengan teks bebas seperti 1/2 toples, 1 bungkus, 2 pak, atau hampir habis.';
+
+    if (!isAdminView && selectedBranchId === 'ALL') {
+        return (
+            <div className="bg-white p-6 rounded-3xl border border-rose-200 shadow-sm text-center space-y-2">
+                <div className="text-3xl">📍</div>
+                <h2 className="text-lg font-extrabold text-brand-950">Pilih cabang dulu</h2>
+                <p className="text-sm text-gray-600">
+                    Pilih cabang di pojok kanan atas supaya stok yang Anda isi masuk ke cabang yang benar.
+                </p>
+            </div>
+        );
+    }
 
     return (
         <div className="space-y-6">
@@ -3346,13 +3461,20 @@ function ReportExportModal({ log, branchName, materials, branchMaterialStock = {
 
     const fallbackStock = branchMaterialStock[log.branchId] || {};
     const materialStatusMap = log.materialStatus && Object.keys(log.materialStatus).length > 0 ? log.materialStatus : fallbackStock;
+    const reportProductNames = new Set(
+        getVisibleProductsForBranch(log.branchId, branchName).map((p) => p.name.trim().toLowerCase())
+    );
+
     const stockRows = Object.entries(materialStatusMap || {})
         .filter(([mId, value]) => {
             if (String(mId).startsWith(AWAL_STOCK_PREFIX)) return false;
             const rawQty = typeof value === 'string' ? value : (value?.qty ?? '');
             const cleanQty = String(rawQty ?? '').trim();
             if (String(mId).startsWith(CUP_STOCK_PREFIX)) return cleanQty !== '';
-            if (isHiddenMaterial(materials.find((item) => item.id === mId))) return false;
+            const rowMaterial = materials.find((item) => item.id === mId);
+            if (isHiddenMaterial(rowMaterial)) return false;
+            // Item bernama sama dengan produk jualan disembunyikan (stok produk sudah tampil otomatis di atas).
+            if (rowMaterial && reportProductNames.has(String(rowMaterial.name || '').trim().toLowerCase())) return false;
             return cleanQty !== '' && cleanQty !== '0' && cleanQty.toLowerCase() !== 'belum ada catatan';
         })
         .map(([mId, value]) => {

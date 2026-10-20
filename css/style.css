@@ -603,7 +603,7 @@ table tbody tr {
 
     .stock-table tbody {
         display: grid !important;
-        grid-template-columns: 1fr 1fr;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
         gap: 10px;
         width: 100% !important;
     }
@@ -665,12 +665,18 @@ table tbody tr {
         font-size: 10px !important;
     }
 
-    .stock-table tbody tr td.stock-sold-cell,
-    .stock-table tbody tr td.stock-subtotal {
+    .stock-table tbody tr td.stock-sold-cell {
         display: flex !important;
         align-items: center;
         justify-content: space-between;
         gap: 6px;
+    }
+
+    .stock-table tbody tr td.stock-subtotal {
+        display: flex !important;
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 2px;
     }
 
     .stock-table tbody tr td.stock-sold-cell::before,
@@ -689,7 +695,18 @@ table tbody tr {
     }
 
     .stock-table tbody tr td.stock-subtotal {
-        font-size: 13px !important;
+        font-size: 15px !important;
         font-weight: 900;
+        white-space: nowrap;
+        max-width: 100%;
+    }
+
+    /* tidak ada geser samping di HP */
+    .stock-table-wrap {
+        overflow-x: hidden !important;
+    }
+
+    .stock-table tbody tr {
+        overflow: hidden;
     }
 }
