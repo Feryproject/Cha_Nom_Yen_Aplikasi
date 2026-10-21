@@ -1009,6 +1009,40 @@ function App() {
         }
     }, [branches, isLoading]);
 
+    // Pemantau status login dipasang SEKALI dan terpisah dari pemantau data Firestore,
+    // supaya "Memeriksa sesi login" selalu selesai walau data belum boleh dimuat.
+    useEffect(() => {
+        if (!window.firebaseAuth) {
+            setAuthReady(true);
+            return;
+        }
+        const unsubscribeAuth = window.firebaseAuth.onAuthStateChanged(async (firebaseUser) => {
+            setAuthUser(firebaseUser);
+            if (!firebaseUser) {
+                setUserProfile(null);
+                setAuthReady(true);
+                setSalesLogs([]);
+                return;
+            }
+
+            try {
+                const profile = await createOrUpdateUserProfile(firebaseUser);
+                setUserProfile(profile);
+            } catch (error) {
+                console.error('Failed to load user profile:', error);
+                setUserProfile({
+                    uid: firebaseUser.uid,
+                    email: firebaseUser.email || '',
+                    role: getDefaultRoleByEmail(firebaseUser.email || ''),
+                    displayName: firebaseUser.displayName || 'Pengguna'
+                });
+            } finally {
+                setAuthReady(true);
+            }
+        });
+        return () => unsubscribeAuth();
+    }, []);
+
     useEffect(() => {
         if (!firestoreDb) {
             const errorMessage = window.firebaseInitError || 'Firebase Firestore belum terinisialisasi. Pastikan konfigurasi Firebase sudah diisi di index.html.';
@@ -1087,37 +1121,11 @@ function App() {
             }
         });
 
-        const unsubscribeAuth = window.firebaseAuth.onAuthStateChanged(async (firebaseUser) => {
-            setAuthUser(firebaseUser);
-            if (!firebaseUser) {
-                setUserProfile(null);
-                setAuthReady(true);
-                setSalesLogs([]);
-                return;
-            }
-
-            try {
-                const profile = await createOrUpdateUserProfile(firebaseUser);
-                setUserProfile(profile);
-            } catch (error) {
-                console.error('Failed to load user profile:', error);
-                setUserProfile({
-                    uid: firebaseUser.uid,
-                    email: firebaseUser.email || '',
-                    role: getDefaultRoleByEmail(firebaseUser.email || ''),
-                    displayName: firebaseUser.displayName || 'Pengguna'
-                });
-            } finally {
-                setAuthReady(true);
-            }
-        });
-
         return () => {
             unsubBranches();
             unsubSalesLogs();
             unsubMaterials();
             unsubStock();
-            unsubscribeAuth();
         };
     }, [authReady, authUser, userRole]);
 
