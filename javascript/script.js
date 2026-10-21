@@ -1018,6 +1018,11 @@ function App() {
             return;
         }
 
+        // Jangan minta data ke Firestore sebelum pengguna login (Rules hanya mengizinkan pengguna yang sudah login),
+        // dan hapus pesan error lama supaya tidak terbawa setelah login.
+        if (!authReady || !authUser) return;
+        setFirestoreError('');
+
         const canReadSalesReports = !!authUser;
 
         console.log('Subscribing to Firestore collections...', { canReadSalesReports, userRole, authReady });
@@ -1036,7 +1041,11 @@ function App() {
 
         let unsubSalesLogs = () => {};
         if (canReadSalesReports) {
-            unsubSalesLogs = firestoreDb.collection(FIRESTORE_COLLECTIONS.salesLogs).onSnapshot({
+            // Bos membaca semua laporan. Karyawan hanya membaca laporan buatannya sendiri
+            // (sesuai Firestore Rules, dan lebih hemat kuota).
+            const salesLogsRef = firestoreDb.collection(FIRESTORE_COLLECTIONS.salesLogs);
+            const salesLogsQuery = userRole === 'admin' ? salesLogsRef : salesLogsRef.where('createdBy', '==', authUser.uid);
+            unsubSalesLogs = salesLogsQuery.onSnapshot({
                 next: (snapshot) => {
                     console.log('snapshot salesLogs received', snapshot.size);
                     const nextLogs = snapshot.docs.map(normalizeFirestoreDoc);
