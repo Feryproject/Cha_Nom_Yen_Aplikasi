@@ -254,6 +254,12 @@ const saveSalesLogDocument = (log) => {
     return firestoreDb.collection(FIRESTORE_COLLECTIONS.salesLogs).doc(id).set(rest, { merge: true });
 };
 
+// Menghapus SATU laporan saja. Tidak membaca atau menulis ulang laporan lain.
+const deleteSalesLogDocument = (id) => {
+    if (!firestoreDb || !id) return Promise.resolve();
+    return firestoreDb.collection(FIRESTORE_COLLECTIONS.salesLogs).doc(id).delete();
+};
+
 // PENTING: fungsi ini HANYA melakukan upsert (create/update) pada dokumen yang
 // benar-benar dikirim di stockMap. Fungsi ini TIDAK PERNAH menghapus dokumen lain
 // yang tidak disebutkan di sini. Ini sengaja dibuat seperti ini agar data stok hari
@@ -751,7 +757,7 @@ const APP_BG_OPACITY = 0.12;
 
 // Nomor WhatsApp Bos untuk menerima laporan, format 62xxxxxxxxxx (tanpa + atau 0 di depan).
 // Kosongkan ("") untuk membuka WhatsApp tanpa nomor tertentu (karyawan pilih kontak sendiri).
-const ADMIN_WHATSAPP_NUMBER = '';
+const ADMIN_WHATSAPP_NUMBER = '6282173376647';
 
 function AppBackground() {
     return (
@@ -1209,7 +1215,7 @@ function App() {
             <div className="min-h-screen flex items-center justify-center bg-[#f7f3eb] text-brand-950">
                 <div className="bg-white px-6 py-5 rounded-3xl shadow-xl border border-brand-200 text-center">
                     <i className="fa-solid fa-spinner fa-spin text-2xl text-amber-700"></i>
-                    <p className="mt-3 font-extrabold">Memuat data dari Firestore...</p>
+                    <p className="mt-3 font-extrabold">Sabar yahhh.....</p>
                 </div>
             </div>
         );
@@ -1454,6 +1460,13 @@ function App() {
                         selectedBranchId={selectedBranchId}
                         salesLogs={salesLogs}
                         setSalesLogs={setSalesLogsSafe}
+                        onDeleteLog={(id) => {
+                            setSalesLogs(prev => prev.filter(l => l.id !== id));
+                            deleteSalesLogDocument(id).catch((error) => {
+                                console.error('salesLogs delete failed:', error);
+                                showToast('Laporan belum terhapus di server. Periksa koneksi lalu coba lagi.', 'error');
+                            });
+                        }}
                         getBranchName={getBranchName}
                         onOpenReport={(log) => setActiveReportLog(log)}
                         setConfirmModal={setConfirmModal}
@@ -3072,7 +3085,7 @@ const exportLogsToExcel = (logs, getBranchName, showToast) => {
     showToast && showToast(`Berhasil mengekspor ${logs.length} laporan ke Excel`);
 };
 
-function HistoryView({ branches, selectedBranchId, salesLogs, setSalesLogs, getBranchName, onOpenReport, setConfirmModal, showToast, role, currentUserId }) {
+function HistoryView({ branches, selectedBranchId, salesLogs, setSalesLogs, onDeleteLog, getBranchName, onOpenReport, setConfirmModal, showToast, role, currentUserId }) {
     const [dateFilter, setDateFilter] = useState('');
     const [periodFilter, setPeriodFilter] = useState('all');
 
@@ -3099,7 +3112,9 @@ function HistoryView({ branches, selectedBranchId, salesLogs, setSalesLogs, getB
             title: 'Hapus Laporan Transaksi',
             message: 'Apakah Anda yakin ingin menghapus data laporan penjualan ini secara permanen?',
             onConfirm: () => {
-                setSalesLogs(salesLogs.filter(l => l.id !== id));
+                // Hapus hanya laporan ini (tidak membaca/menulis ulang laporan lain).
+                if (onDeleteLog) onDeleteLog(id);
+                else setSalesLogs(salesLogs.filter(l => l.id !== id));
                 showToast('Data riwayat berhasil dihapus');
             }
         });
